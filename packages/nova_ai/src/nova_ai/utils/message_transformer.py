@@ -1,0 +1,352 @@
+"""
+消息转换工具
+用于跨提供商兼容性的消息转换
+"""
+
+from typing import List, Dict, Optional, Set, Callable, Union, Any
+import time
+from copy import deepcopy
+
+from ..core.messages import (
+    Message, UserMessage, AssistantMessage, ToolResultMessage,
+    MessageUnion
+)
+from ..core.content import (
+    TextContent, ThinkingContent, ToolCall, ImageContent, ContentUnion
+)
+from ..models import Model
+from ..core.enums import StopReason, Api
+
+
+def transform_messages(
+    messages: List[Message],
+    model: Model,
+    normalize_tool_call_id: Optional[Callable[[str, Model, AssistantMessage], str]] = None
+) -> List[Message]:
+    """
+    转换消息以实现跨提供商兼容性
+    
+    Args:
+        messages: 原始消息列表
+        model: 目标模型
+        normalize_tool_call_id: 可选的工具调用ID规范化函数
+        
+    Returns:
+        转换后的消息列表
+    """
+    # 构建原始工具调用ID到规范化ID的映射
+    tool_call_id_map: Dict[str, str] = {}
+    
+    # 第一遍：转换消息（思考块、工具调用ID规范化）
+    transformed: List[Message] = []
+    
+    for msg in messages:
+        # 用户消息保持不变
+        if msg.role == "user":
+            transformed.append(msg)
+            continue
+        
+        # 处理 toolResult 消息 - 如果有映射则规范化 toolCallId
+        if msg.role == "toolResult":
+            tool_result = msg
+            normalized_id = tool_call_id_map.get(tool_result.tool_call_id)
+            if normalized_id and normalized_id != tool_result.tool_call_id:
+                # 创建新的 toolResult 消息，更新 toolCallId
+                new_tool_result = ToolResultMessage(
+                    role="toolResult",
+                    tool_call_id=normalized_id,
+                    tool_name=tool_result.tool_name,
+                    content=tool_result.content,
+                    details=tool_result.details,
+                    is_error=tool_result.is_error,
+                    timestamp=tool_result.timestamp
+                )
+                transformed.append(new_tool_result)
+            else:
+                transformed.append(msg)
+            continue
+        
+        # 助手消息需要转换检查
+        if msg.role == "assistant":
+            assistant_msg = msg
+            is_same_model = (
+                assistant_msg.provider == model.provider and
+                assistant_msg.api == model.api and
+                assistant_msg.model == model.id
+            )
+            
+            transformed_content: List[ContentUnion] = []
+            
+            for block in assistant_msg.content:
+                if block.type == "thinking":
+                    thinking_block = block
+                    
+                    # 被屏蔽的思考是加密的不透明内容，仅对同一模型有效
+                    # 跨模型时删除以避免API错误
+                    if thinking_block.redacted:
+                        if is_same_model:
+                            transformed_content.append(thinking_block)
+                        continue
+                    
+                    # 对于同一模型：保留带有签名的思考块（用于重放）
+                    # 即使思考文本为空（OpenAI加密推理）
+                    if is_same_model and thinking_block.thinking_signature:
+                        transformed_content.append(thinking_block)
+                        continue
+                    
+                    # 跳过空的思考块，其他转换为纯文本
+                    if not thinking_block.thinking or thinking_block.thinking.strip() == "":
+                        continue
+                    
+                    if is_same_model:
+                        transformed_content.append(thinking_block)
+                    else:
+                        # 转换为文本块
+                        transformed_content.append(
+                            TextContent(
+                                type="text",
+                                text=thinking_block.thinking
+                            )
+                        )
+                
+                elif block.type == "text":
+                    text_block = block
+                    if is_same_model:
+                        transformed_content.append(text_block)
+                    else:
+                        # 保留文本内容
+                        transformed_content.append(
+                            TextContent(
+                                type="text",
+                                text=text_block.text,
+                                text_signature=text_block.text_signature if is_same_model else None
+                            )
+                        )
+                
+                elif block.type == "toolCall":
+                    tool_call = block
+                    normalized_tool_call = deepcopy(tool_call)
+                    
+                    # 跨模型时删除 thought_signature
+                    if not is_same_model and tool_call.thought_signature:
+                        normalized_tool_call.thought_signature = None
+                    
+                    # 规范化工具调用ID
+                    if not is_same_model and normalize_tool_call_id:
+                        normalized_id = normalize_tool_call_id(
+                            tool_call.id, 
+                            model, 
+                            assistant_msg
+                        )
+                        if normalized_id != tool_call.id:
+                            tool_call_id_map[tool_call.id] = normalized_id
+                            normalized_tool_call.id = normalized_id
+                    
+                    transformed_content.append(normalized_tool_call)
+                
+                else:
+                    # 其他类型保持不变
+                    transformed_content.append(block)
+            
+            # 创建新的助手消息
+            new_assistant_msg = AssistantMessage(
+                role="assistant",
+                content=transformed_content,
+                api=assistant_msg.api,
+                provider=assistant_msg.provider,
+                model=assistant_msg.model,
+                usage=assistant_msg.usage,
+                stop_reason=assistant_msg.stop_reason,
+                error_message=assistant_msg.error_message,
+                timestamp=assistant_msg.timestamp
+            )
+            transformed.append(new_assistant_msg)
+            continue
+        
+        # 其他类型保持不变
+        transformed.append(msg)
+    
+    # 第二遍：为孤立的工具调用插入合成的空工具结果
+    # 这可以保留思考签名并满足API要求
+    result: List[Message] = []
+    pending_tool_calls: List[ToolCall] = []
+    existing_tool_result_ids: Set[str] = set()
+    
+    for i, msg in enumerate(transformed):
+        
+        if msg.role == "assistant":
+            assistant_msg = msg
+            
+            # 如果有待处理的孤立工具调用，现在插入合成结果
+            if pending_tool_calls:
+                for tc in pending_tool_calls:
+                    if tc.id not in existing_tool_result_ids:
+                        result.append(
+                            ToolResultMessage(
+                                role="toolResult",
+                                tool_call_id=tc.id,
+                                tool_name=tc.name,
+                                content=[TextContent(type="text", text="No result provided")],
+                                is_error=True,
+                                timestamp=int(time.time() * 1000)  # 当前时间戳（毫秒）
+                            )
+                        )
+                pending_tool_calls = []
+                existing_tool_result_ids = set()
+            
+            # 跳过错误/中止的助手消息
+            # 这些是不完整的历史记录，不应该重放：
+            # - 可能有部分内容（推理而没有消息，不完整的工具调用）
+            # - 重放它们可能导致API错误（例如OpenAI "reasoning without following item"）
+            # - 模型应该从最后一个有效状态重试
+            if assistant_msg.stop_reason in [StopReason.ERROR, StopReason.ABORTED]:
+                continue
+            
+            # 跟踪此助手消息中的工具调用
+            tool_calls = [
+                block for block in assistant_msg.content 
+                if block.type == "toolCall"
+            ]
+            if tool_calls:
+                pending_tool_calls = tool_calls
+                existing_tool_result_ids = set()
+            
+            result.append(msg)
+        
+        elif msg.role == "toolResult":
+            tool_result = msg
+            existing_tool_result_ids.add(tool_result.tool_call_id)
+            result.append(msg)
+        
+        elif msg.role == "user":
+            # 用户消息中断工具流 - 为孤立调用插入合成结果
+            if pending_tool_calls:
+                for tc in pending_tool_calls:
+                    if tc.id not in existing_tool_result_ids:
+                        result.append(
+                            ToolResultMessage(
+                                role="toolResult",
+                                tool_call_id=tc.id,
+                                tool_name=tc.name,
+                                content=[TextContent(type="text", text="No result provided")],
+                                is_error=True,
+                                timestamp=int(time.time() * 1000)
+                            )
+                        )
+                pending_tool_calls = []
+                existing_tool_result_ids = set()
+            result.append(msg)
+        
+        else:
+            result.append(msg)
+    
+    return result
+
+
+def normalize_openai_tool_call_id(
+    tool_call_id: str,
+    model: Model,
+    source_msg: AssistantMessage
+) -> str:
+    """
+    OpenAI工具调用ID规范化函数
+    
+    OpenAI Responses API生成的ID长达450+字符，包含`|`等特殊字符。
+    Anthropic等API要求ID匹配 ^[a-zA-Z0-9_-]+$（最多64字符）。
+    
+    Args:
+        tool_call_id: 原始工具调用ID
+        model: 目标模型
+        source_msg: 源消息
+        
+    Returns:
+        规范化的工具调用ID
+    """
+    # 如果ID已经是简单格式，直接返回
+    import re
+    if re.match(r'^[a-zA-Z0-9_-]{1,64}$', tool_call_id):
+        return tool_call_id
+    
+    # 生成简化的ID
+    # 使用原始ID的哈希或最后部分
+    import hashlib
+    
+    # 方法1：使用hash截断
+    hash_obj = hashlib.sha256(tool_call_id.encode())
+    short_id = hash_obj.hexdigest()[:16]
+    
+    # 方法2：从原始ID提取有效字符
+    # 提取字母数字和_-，取最后部分
+    valid_chars = ''.join(c for c in tool_call_id if c.isalnum() or c in '_-')
+    if valid_chars:
+        # 取最后最多16个字符
+        short_id = valid_chars[-16:]
+    else:
+        # 如果完全没有有效字符，使用时间戳
+        short_id = f"call_{int(time.time())}"
+    
+    # 确保不超过64字符
+    return short_id[:64]
+
+
+def normalize_anthropic_tool_call_id(
+    tool_call_id: str,
+    model: Model,
+    source_msg: AssistantMessage
+) -> str:
+    """
+    Anthropic工具调用ID规范化函数
+    
+    Anthropic要求ID格式: ^[a-zA-Z0-9_-]+$，最多64字符
+    
+    Args:
+        tool_call_id: 原始工具调用ID
+        model: 目标模型
+        source_msg: 源消息
+        
+    Returns:
+        规范化的工具调用ID
+    """
+    import re
+    
+    # 移除所有不允许的字符
+    normalized = re.sub(r'[^a-zA-Z0-9_-]', '', tool_call_id)
+    
+    # 如果结果为空，生成一个默认ID
+    if not normalized:
+        import hashlib
+        import time
+        normalized = f"tool_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
+    
+    # 限制长度
+    return normalized[:64]
+
+
+def should_keep_thinking_block(
+    thinking_block: ThinkingContent,
+    is_same_model: bool
+) -> bool:
+    """
+    判断是否应该保留思考块
+    
+    Args:
+        thinking_block: 思考块
+        is_same_model: 是否是同一模型
+        
+    Returns:
+        是否保留
+    """
+    # 被屏蔽的思考仅对同一模型有效
+    if thinking_block.redacted:
+        return is_same_model
+    
+    # 同一模型：只要有签名就保留（即使是空的）
+    if is_same_model and thinking_block.thinking_signature:
+        return True
+    
+    # 不同模型：只有有内容的才保留（会转换为文本）
+    if not is_same_model:
+        return bool(thinking_block.thinking and thinking_block.thinking.strip())
+    
+    # 同一模型但没有签名：保留有内容的
+    return bool(thinking_block.thinking and thinking_block.thinking.strip())
