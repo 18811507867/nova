@@ -301,9 +301,8 @@ def convert_messages(
                                 "url": f"data:{item.mime_type};base64,{item.data}"
                             }
                         })
-                
                 if "image" not in model.input_types:
-                    content = [c for c in content if c["type"] != "image_url"]
+                    content = [c for c in content if c.get("type") != "image_url"]
                 
                 if content:
                     params.append({
@@ -404,7 +403,7 @@ def convert_messages(
                     "tool_call_id": curr.tool_call_id
                 }
                 if compat.requires_tool_result_name and curr.tool_name:
-                    tool_result_param["name"] = curr.tool_name
+                    tool_result_param.name = curr.tool_name
                 
                 params.append(tool_result_param)
                 
@@ -613,29 +612,29 @@ async def stream_openai_completions(
         def finish_current_block(block=None):
             nonlocal current_block, current_block_index
             if block:
-                if block["type"] == "text":
+                if block.type == "text":
                     stream.push(TextEndEvent(
                         content_index=current_block_index,
-                        content=block["text"],
+                        content=block,
                         partial=deepcopy(output)
                     ))
-                elif block["type"] == "thinking":
+                elif block.type == "thinking":
                     stream.push(ThinkingEndEvent(
                         content_index=current_block_index,
-                        content=block["thinking"],
+                        content=block,
                         partial=deepcopy(output)
                     ))
-                elif block["type"] == "toolCall":
-                    block["arguments"] = parse_streaming_json(block.get("partial_args", ""))
-                    if "partial_args" in block:
-                        del block["partial_args"]
+                elif block.type == "toolCall":
+                    block.arguments = parse_streaming_json(block.partial_args)
+                    if hasattr(block, "partial_args"):
+                        del block.partial_args
                     stream.push(ToolCallEndEvent(
                         content_index=current_block_index,
                         tool_call=ToolCall(
-                            id=block["id"],
-                            name=block["name"],
-                            arguments=block["arguments"],
-                            thought_signature=block.get("thought_signature")
+                            id=block.id,
+                            name=block.name,
+                            arguments=block.arguments,
+                            thought_signature=block.thought_signature if hasattr(block, "thought_signature") else None
                         ),
                         partial=deepcopy(output)
                     ))
@@ -670,9 +669,13 @@ async def stream_openai_completions(
                 delta = choice.delta
                 
                 if delta.content and len(delta.content) > 0:
-                    if not current_block or current_block["type"] != "text":
+                    if not current_block or current_block.type != "text":
                         finish_current_block(current_block)
-                        current_block = {"type": "text", "text": ""}
+                        current_block = TextContent(
+                            type = "text", 
+                            text = ""
+                                                    
+                        )
                         output.content.append(current_block)
                         current_block_index = len(output.content) - 1
                         stream.push(TextStartEvent(
@@ -680,8 +683,8 @@ async def stream_openai_completions(
                             partial=deepcopy(output)
                         ))
                     
-                    if current_block["type"] == "text":
-                        current_block["text"] += delta.content
+                    if current_block.type == "text":
+                        current_block.text += delta.content
                         stream.push(TextDeltaEvent(
                             content_index=current_block_index,
                             delta=delta.content,
@@ -698,13 +701,13 @@ async def stream_openai_completions(
                         break
                 
                 if found_reasoning:
-                    if not current_block or current_block["type"] != "thinking":
+                    if not current_block or current_block.type != "thinking":
                         finish_current_block(current_block)
-                        current_block = {
-                            "type": "thinking",
-                            "thinking": "",
-                            "thinking_signature": found_reasoning
-                        }
+                        current_block = ThinkingContent(
+                            type = "thinking",
+                            thinking = "",
+                            thinking_signature = found_reasoning
+                        )
                         output.content.append(current_block)
                         current_block_index = len(output.content) - 1
                         stream.push(ThinkingStartEvent(
@@ -712,9 +715,9 @@ async def stream_openai_completions(
                             partial=deepcopy(output)
                         ))
                     
-                    if current_block["type"] == "thinking":
+                    if current_block.type == "thinking":
                         delta_text = delta_dict[found_reasoning]
-                        current_block["thinking"] += delta_text
+                        current_block.thinking += delta_text
                         stream.push(ThinkingDeltaEvent(
                             content_index=current_block_index,
                             delta=delta_text,
@@ -724,16 +727,16 @@ async def stream_openai_completions(
                 if delta.tool_calls:
                     for tool_call in delta.tool_calls:
                         if (not current_block or 
-                            current_block["type"] != "toolCall" or
-                            (tool_call.id and current_block["id"] != tool_call.id)):
+                            current_block.type != "toolCall" or
+                            (tool_call.id and current_block.id != tool_call.id)):
                             finish_current_block(current_block)
-                            current_block = {
-                                "type": "toolCall",
-                                "id": tool_call.id or "",
-                                "name": tool_call.function.name if tool_call.function else "",
-                                "arguments": {},
-                                "partial_args": ""
-                            }
+                            current_block = ToolCall(
+                                type="toolCall",
+                                id=tool_call.id or "",
+                                name=tool_call.function.name if tool_call.function else "",
+                                arguments={},
+                            )
+                            current_block.partial_args=""
                             output.content.append(current_block)
                             current_block_index = len(output.content) - 1
                             stream.push(ToolCallStartEvent(
@@ -741,17 +744,17 @@ async def stream_openai_completions(
                                 partial=deepcopy(output)
                             ))
                         
-                        if current_block["type"] == "toolCall":
+                        if current_block.type == "toolCall":
                             if tool_call.id:
-                                current_block["id"] = tool_call.id
+                                current_block.id = tool_call.id
                             if tool_call.function and tool_call.function.name:
-                                current_block["name"] = tool_call.function.name
+                                current_block.name = tool_call.function.name
                             
                             delta_args = ""
                             if tool_call.function and tool_call.function.arguments:
                                 delta_args = tool_call.function.arguments
-                                current_block["partial_args"] = current_block.get("partial_args", "") + delta_args
-                                current_block["arguments"] = parse_streaming_json(current_block["partial_args"])
+                                current_block.partial_args = current_block.partial_args + delta_args
+                                current_block.arguments = parse_streaming_json(current_block.partial_args)
                             
                             stream.push(ToolCallDeltaEvent(
                                 content_index=current_block_index,
@@ -767,9 +770,9 @@ async def stream_openai_completions(
                                 detail.get("type") == "reasoning.encrypted" and
                                 detail.get("id") and detail.get("data")):
                                 for block in output.content:
-                                    if (block.get("type") == "toolCall" and 
-                                        block.get("id") == detail["id"]):
-                                        block["thought_signature"] = json.dumps(detail)
+                                    if (block.type == "toolCall" and 
+                                        block.id == detail.id):
+                                        block.thought_signature = json.dumps(detail)
                                         break
         
         finish_current_block(current_block)
@@ -789,7 +792,7 @@ async def stream_openai_completions(
         # except Exception as e:
         #     for block in output.content:
         #         if "partial_args" in block:
-        #             del block["partial_args"]
+        #             del block.partial_args
             
         #     output.stop_reason = StopReason.ABORTED if (options and options.signal and options.signal.aborted) else StopReason.ERROR
         #     output.error_message = str(e)

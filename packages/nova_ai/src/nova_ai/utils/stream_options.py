@@ -24,7 +24,7 @@ class StreamOptions:
     """流式选项"""
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
-    signal: Any = None  # Python中可以使用asyncio.Event或自定义信号
+    signal: Optional[Any] = None  # Python中可以使用asyncio.Event或自定义信号
     api_key: Optional[str] = None
     transport: Optional[Transport] = None  # 传输协议偏好
     cache_retention: Optional[CacheRetention] = None

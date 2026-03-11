@@ -69,6 +69,7 @@ def get_env_api_key(provider: str) -> Optional[str]:
         "huggingface": "HF_TOKEN",
         "opencode": "OPENCODE_API_KEY",
         "kimi-coding": "KIMI_API_KEY",
+        "volcengine": "VOLCENGINE_API_KEY",
     }
     
     env_var = env_map.get(provider)

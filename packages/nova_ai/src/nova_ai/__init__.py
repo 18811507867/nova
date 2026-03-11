@@ -96,6 +96,7 @@ from .auth import (
 
 # 重新导出models模块（仅数据）
 from .models import (
+    Model, ModelCost,
     OPENAI_MODELS, ANTHROPIC_MODELS, GOOGLE_MODELS,
     get_openai_model, get_anthropic_model, get_google_model,
     list_openai_models, list_anthropic_models, list_google_models,
